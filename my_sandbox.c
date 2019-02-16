@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <limits.h>
+#include <fcntl.h>
 
 #include "sandbox_types.h"
 
@@ -21,6 +22,7 @@
 bool syscall_whitelist_g[NUM_SYSCALLS];
 sfp_list_t g_sandbox_perms;
 
+void handle_violation(struct user_regs_struct* regs, pid_t child_pid);
 int handle_syscall(struct user_regs_struct* regs, pid_t child_pid,\
                    bool* syscall_whitelist, size_t syscall_whitelist_length);
 void print_reg(long long reg_val, pid_t child_pid, char* reg_name);
@@ -34,10 +36,11 @@ void allow_file_access_syscalls(void) {
   syscall_whitelist_g[6]  = true; //lstat
   syscall_whitelist_g[21] = true; //access
   syscall_whitelist_g[76] = true; //truncate
-  syscall_whitelist_g[82] = true; //rename
+  //syscall_whitelist_g[82] = true; //rename
   syscall_whitelist_g[83] = true; //mkdir
   syscall_whitelist_g[84] = true; //rmdir
-  //... there are more, but not these can be toggled as req
+  //... there are more, but not these can be toggled as req.
+  // Also have to handle them in some way which can be trickyyy
 }
 
 void init_allowed_syscalls(void) {
@@ -184,13 +187,14 @@ int main(int argc, char** argv) {
     // Now repeatedly resume and trace the program
     bool running = true;
     int last_signal = 0;
+    bool entry = true;
     while(running) {
       // Continue the process, delivering the last signal we received (if any)
       if(ptrace(PTRACE_SYSCALL, child_pid, NULL, last_signal) == -1) {
         perror("ptrace CONT failed");
         exit(2);
       }
-
+      
       // No signal to send yet
       last_signal = 0;
 
@@ -209,9 +213,19 @@ int main(int argc, char** argv) {
       } else if(WIFSTOPPED(status)) {
         // Get the signal delivered to the child
         last_signal = WSTOPSIG(status);
-
+        
         // If the signal was a SIGTRAP, we stopped because of a system call
         if(last_signal == SIGTRAP) {
+
+          /* We only care about entries to syscalls (every other call) */
+          if(!entry) {
+            entry = true;
+            last_signal = 0;
+            continue;
+          } else {
+            entry = false;
+          }
+
           // Read register state from the child process
           struct user_regs_struct regs;
           if(ptrace(PTRACE_GETREGS, child_pid, NULL, &regs)) {
@@ -232,7 +246,7 @@ int main(int argc, char** argv) {
 #endif
           }
 
-          last_signal = 0;
+        last_signal = 0;
         }
       }
     }
@@ -252,27 +266,44 @@ int handle_syscall(struct user_regs_struct* regs, pid_t child_pid,
     exit(1);
   }
   if(!syscall_whitelist[syscall_num]) {
+    handle_violation(regs, child_pid);
+  } else {
+    /* open w/ read, stat, lstat, access */
+    if((syscall_num == 2 && (regs->rsi & O_RDONLY || regs->rsi & O_RDWR)) ||
+       syscall_num == 4  || syscall_num == 6 || syscall_num == 21) {
+      char try_file[100] = {0};
+      reg_to_str(regs->rdi, child_pid, try_file, 100);
+      printf("syscall: %lu, file: %s\n", syscall_num, try_file);
+      if(!strlen(try_file)) { try_file[0] = '.'; }
+      /* Handle weird case with libraries that are loaded in that don't actually exist in user filesystem?? Suspected NFS shenanigans. Just let these happen... */
+      if(access(try_file, R_OK) != -1) {
 
-    printf("Program made system call syscall #%lu\n",
-           syscall_num);
-    
-    /* print out relevant reg data */
-    print_reg(regs->rdi, child_pid, "%rdi");
-    print_reg(regs->rsi, child_pid, "%rsi");
-    print_reg(regs->rdx, child_pid, "%rdx");
-    print_reg(regs->rax, child_pid, "%rax");
-
-    /* Handle duplicate syscalls of no value (specifically exec) */
-    if(!regs->rdi && !regs->rsi && !regs->rdx && !regs->rax) {
-      return 0;
+        /* Test if readable by user-specified sandbox perms */
+        if(!sfp_is_accessible(&g_sandbox_perms, try_file, 'r')) {
+          fprintf(stderr,
+                  "Sandboxed process tried to read file: %s\n", try_file);
+          handle_violation(regs, child_pid);
+        }
+      }
+      /* open w/ write, truncate, mkdir, rmdir */
     }
-    printf("Sandboxed process killed.\n");
-#ifndef DBG
-    kill(child_pid, SIGKILL); //TODO kill children's children??
+    if((syscall_num == 2 &&
+        (regs->rsi & O_WRONLY || regs->rsi & O_RDWR)) ||
+       syscall_num == 76 ||
+       syscall_num == 83 || syscall_num == 84) {
+      char try_file[100] = {0};
+      reg_to_str(regs->rdi, child_pid, try_file, 100);
 
-    exit(1);
-#endif
+      if(access(try_file, W_OK) != -1) {
+        if(!sfp_is_accessible(&g_sandbox_perms, try_file, 'w')) {
+          fprintf(stderr,
+                  "Sandboxed process tried to write file: %s\n", try_file);
+          handle_violation(regs, child_pid);
+        }
+      }
+    }
   }
+
   return 0;
 }
 void print_reg(long long reg_val, pid_t child_pid, char* reg_name) {
@@ -295,6 +326,24 @@ bool is_ascii(char* data) {
   return true;
 }
 
+void handle_violation(struct user_regs_struct* regs, pid_t child_pid) {
+  printf("Program made system call syscall #%llu\n",
+           regs->orig_rax);
+    
+  /* print out relevant reg data */
+  print_reg(regs->rdi, child_pid, "%rdi");
+  print_reg(regs->rsi, child_pid, "%rsi");
+  print_reg(regs->rdx, child_pid, "%rdx");
+  print_reg(regs->rax, child_pid, "%rax");
+  
+  printf("Sandboxed process killed.\n");
+#ifndef DBG
+  kill(child_pid, SIGKILL); //TODO kill children's children??
+  
+  exit(1);
+#endif
+}
+
 void reg_to_str(long long reg_val, pid_t child_pid, char str_val[], size_t str_val_len) {
 
   /* Definitely not an address if < 100... */
@@ -308,6 +357,7 @@ void reg_to_str(long long reg_val, pid_t child_pid, char str_val[], size_t str_v
 
     /* Peek 8 bytes and copy it into str_val */
     long long val = ptrace(PTRACE_PEEKTEXT, child_pid, reg_val+i, 0);
+
     memcpy(str_val+i, &val, sizeof(long long));
 
 #ifdef DBGG
