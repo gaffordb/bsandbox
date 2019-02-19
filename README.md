@@ -41,6 +41,7 @@ Further usage can be found in test cases (specifically run_tests.sh files).
  
 # Testing
 * Each sub-directory within the `tests` directory will contain a Makefile. Within each directory, run `make test` and verify output is as expected.  
+* Note: Not much time was put into making testing pretty/automated
 * Tests include: 
   * Accessibility testing
     * Ensures that the internal fine-grained r/w permission library is functioning as intended.
