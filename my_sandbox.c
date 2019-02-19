@@ -29,14 +29,14 @@ void print_reg(long long reg_val, pid_t child_pid, char* reg_name);
 void reg_to_str(long long reg_val, pid_t child_pid, char str_val[],     \
                 size_t str_val_len);
 bool is_ascii(char* data);
-
+void trace_pid
 void allow_file_access_syscalls(void) {
   syscall_whitelist_g[2]  = true; //open
   syscall_whitelist_g[4]  = true; //stat
   syscall_whitelist_g[6]  = true; //lstat
   syscall_whitelist_g[21] = true; //access
   syscall_whitelist_g[76] = true; //truncate
-  //syscall_whitelist_g[82] = true; //rename
+  //syscall_whitelist_g[82] = true; //rename requires special handling
   syscall_whitelist_g[83] = true; //mkdir
   syscall_whitelist_g[84] = true; //rmdir
   //... there are more, but not these can be toggled as req.
@@ -48,18 +48,26 @@ void init_allowed_syscalls(void) {
   
   int allowed_syscalls[NUM_SYSCALLS] = {
     0, 1, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14,
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27,
     28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
     42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55,
     60, 61, 63, 66, 67, 69, 70, 71, 72, 73, 74, 75, 77,
     78, 80, 81, 91, 93, 96, 97, 100, 102, 104, 105, 106, 107,
     108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118,
-    119, 120, 121, 122, 123, 124, 137, 158, 218, 231, 273, -1
+    119, 120, 121, 122, 123, 124, 137, 158, 218, 221, 231, 273, -1
   };
   
   for(int i = 0; allowed_syscalls[i] != -1; i++) {
     syscall_whitelist_g[allowed_syscalls[i]] = true;
   }
+  
+  syscall_whitelist_g[2] = true;
+  syscall_whitelist_g[4] = true;
+
+  sfp_add(&g_sandbox_perms, "/home/walker/MyroC/lib", 'r');
+  sfp_add(&g_sandbox_perms, "/lib/x86_64-linux-gnu/libc.so.6", 'r');
+  sfp_add(&g_sandbox_perms, "/usr/lib/locale", 'r');
+  sfp_add(&g_sandbox_perms, "/etc/ld.so.cache", 'r');
 }
 void print_usage(void) {
   printf("usage: sandbox executable [arg1 arg2 ...]\n");
@@ -124,12 +132,12 @@ char** parse_args(int argc, char** argv) {
     print_usage();
     exit(1);
   }
-
+  int i;
   /* Get the program name to be executed and args for later exec */
-  for(int i = 0; optind < argc; optind++, i++) {
+  for(i = 0; optind < argc; optind++, i++) {
     tracee_args[i] = argv[optind];
   }
-  tracee_args[optind] = NULL;
+  tracee_args[i] = NULL;
   
   return tracee_args;
 }
@@ -254,7 +262,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 }
-
+/* if fork, then call the trace thing on child process -- need to extract this code to diff stuff */
 
 int handle_syscall(struct user_regs_struct* regs, pid_t child_pid,
                    bool* syscall_whitelist, size_t syscall_whitelist_length) {
@@ -265,17 +273,27 @@ int handle_syscall(struct user_regs_struct* regs, pid_t child_pid,
     fprintf(stderr, "Invalid syscall number: %lu.\n", syscall_num);
     exit(1);
   }
+      
   if(!syscall_whitelist[syscall_num]) {
-    handle_violation(regs, child_pid);
+    
+    //opening internal libs is okay?
+    char try_file[100] = {0};
+    reg_to_str(regs->rdi, child_pid, try_file, 100);
+
+    //if the file isn't accessible via filesys, it's aight
+    if(!((syscall_num == 2 || syscall_num == 21 || syscall_num == 4) && access(try_file, F_OK))) {
+      handle_violation(regs, child_pid);
+    }
   } else {
     /* open w/ read, stat, lstat, access */
-    if((syscall_num == 2 && (regs->rsi & O_RDONLY || regs->rsi & O_RDWR)) ||
+    /* need to bitwise and rsi w/ 3 bc dumb value interplay */
+    if((syscall_num == 2 && ((regs->rsi & 3) == O_RDONLY || (regs->rsi & 3) == O_RDWR)) ||
        syscall_num == 4  || syscall_num == 6 || syscall_num == 21) {
       char try_file[100] = {0};
       reg_to_str(regs->rdi, child_pid, try_file, 100);
-      printf("syscall: %lu, file: %s\n", syscall_num, try_file);
+
       if(!strlen(try_file)) { try_file[0] = '.'; }
-      /* Handle weird case with libraries that are loaded in that don't actually exist in user filesystem?? Suspected NFS shenanigans. Just let these happen... */
+      /* Handle weird case with libraries that are loaded in that don't actually exist in user filesystem?? Just let these happen... */
       if(access(try_file, R_OK) != -1) {
 
         /* Test if readable by user-specified sandbox perms */
@@ -288,7 +306,7 @@ int handle_syscall(struct user_regs_struct* regs, pid_t child_pid,
       /* open w/ write, truncate, mkdir, rmdir */
     }
     if((syscall_num == 2 &&
-        (regs->rsi & O_WRONLY || regs->rsi & O_RDWR)) ||
+        ((regs->rsi & 3) == O_WRONLY || (regs->rsi & 3) == O_RDWR)) ||
        syscall_num == 76 ||
        syscall_num == 83 || syscall_num == 84) {
       char try_file[100] = {0};
@@ -327,7 +345,7 @@ bool is_ascii(char* data) {
 }
 
 void handle_violation(struct user_regs_struct* regs, pid_t child_pid) {
-  printf("Program made system call syscall #%llu\n",
+  printf("Program made syscall #%llu\n",
            regs->orig_rax);
     
   /* print out relevant reg data */

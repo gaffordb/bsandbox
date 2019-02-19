@@ -2,9 +2,9 @@
 #  https://www.cs.swarthmore.edu/~newhall/unixhelp/howto_makefiles.html
 
 CC = gcc
-CFLAGS  = -g -Wall
+CFLAGS  = -g -Wall #-fsanitize=address
 
-all: sandbox
+all: sandbox ./Makefile
 
 sandbox:  sandbox.o sfp_list.o 
 	$(CC) $(CFLAGS) -o sandbox sandbox.o sfp_list.o
