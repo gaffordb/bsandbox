@@ -56,6 +56,21 @@ void sfp_destroy_list(sfp_list_t* lst) {
 }
 
 void sfp_add(sfp_list_t* lst, char* fname, char perm) {
+
+  /* Make sure values make sense */
+  assert(read || write);
+  if(read) {
+    if(access(fname, R_OK) == -1) {
+      fprintf("Note: Attempted to add %s with perms %c. This failed because either the file does not exist or the specified permission does not make sense with the calling process's permissions.\n", fname, perm);
+      return;
+    }
+  }
+  if(write) {
+    if(access(fname, W_OK) == -1) {
+      fprintf("Note: Attempted to add %s with perms %c. This failed because either the file does not exist or the specified permission does not make sense with the calling process's permissions.\n", fname, perm);
+    }
+  }
+  
   sfp_node_t* to_add = malloc(sizeof(sfp_node_t));
   if(!to_add) {
     perror("malloc failed");
@@ -64,15 +79,6 @@ void sfp_add(sfp_list_t* lst, char* fname, char perm) {
   
   bool read = perm == 'r';
   bool write = perm == 'w';
-
-  /* Make sure values make sense */
-  assert(read || write);
-  if(read) {
-    assert(access(fname, R_OK) != -1);
-  }
-  if(write) {
-    assert(access(fname, W_OK) != -1);
-  }
 
   to_add->val = (sandbox_fperms_t){ fname, read, write };
   if(lst->first == NULL) {

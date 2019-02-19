@@ -29,7 +29,7 @@ void print_reg(long long reg_val, pid_t child_pid, char* reg_name);
 void reg_to_str(long long reg_val, pid_t child_pid, char str_val[],     \
                 size_t str_val_len);
 bool is_ascii(char* data);
-void trace_pid
+
 void allow_file_access_syscalls(void) {
   syscall_whitelist_g[2]  = true; //open
   syscall_whitelist_g[4]  = true; //stat
